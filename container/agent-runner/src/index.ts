@@ -6,6 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import { OpenAI } from 'openai';
 import { createIpcMcp } from './ipc-mcp.js';
 
 interface ContainerInput {
@@ -15,6 +16,8 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  provider?: 'anthropic' | 'openai' | 'ollama';
+  model?: string;
 }
 
 interface AgentResponse {
@@ -85,79 +88,48 @@ function log(message: string): void {
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
-  // sessions-index.json is in the same directory as the transcript
   const projectDir = path.dirname(transcriptPath);
   const indexPath = path.join(projectDir, 'sessions-index.json');
-
-  if (!fs.existsSync(indexPath)) {
-    log(`Sessions index not found at ${indexPath}`);
-    return null;
-  }
-
+  if (!fs.existsSync(indexPath)) return null;
   try {
     const index: SessionsIndex = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
     const entry = index.entries.find(e => e.sessionId === sessionId);
-    if (entry?.summary) {
-      return entry.summary;
-    }
+    if (entry?.summary) return entry.summary;
   } catch (err) {
     log(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
   }
-
   return null;
 }
 
-/**
- * Archive the full transcript to conversations/ before compaction.
- */
 function createPreCompactHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preCompact = input as PreCompactHookInput;
     const transcriptPath = preCompact.transcript_path;
     const sessionId = preCompact.session_id;
-
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      log('No transcript found for archiving');
-      return {};
-    }
-
+    if (!transcriptPath || !fs.existsSync(transcriptPath)) return {};
     try {
       const content = fs.readFileSync(transcriptPath, 'utf-8');
       const messages = parseTranscript(content);
-
-      if (messages.length === 0) {
-        log('No messages to archive');
-        return {};
-      }
-
+      if (messages.length === 0) return {};
       const summary = getSessionSummary(sessionId, transcriptPath);
       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-
       const conversationsDir = '/workspace/group/conversations';
       fs.mkdirSync(conversationsDir, { recursive: true });
-
       const date = new Date().toISOString().split('T')[0];
       const filename = `${date}-${name}.md`;
       const filePath = path.join(conversationsDir, filename);
-
       const markdown = formatTranscriptMarkdown(messages, summary);
       fs.writeFileSync(filePath, markdown);
-
       log(`Archived conversation to ${filePath}`);
     } catch (err) {
       log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
     }
-
     return {};
   };
 }
 
 function sanitizeFilename(summary: string): string {
-  return summary
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 50);
+  return summary.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50);
 }
 
 function generateFallbackName(): string {
@@ -165,99 +137,63 @@ function generateFallbackName(): string {
   return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
 }
 
-interface ParsedMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
+interface ParsedMessage { role: 'user' | 'assistant'; content: string; }
 
 function parseTranscript(content: string): ParsedMessage[] {
   const messages: ParsedMessage[] = [];
-
   for (const line of content.split('\n')) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
       if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
+        const text = typeof entry.message.content === 'string' ? entry.message.content : entry.message.content.map((c: any) => c.text || '').join('');
         if (text) messages.push({ role: 'user', content: text });
       } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
+        const textParts = entry.message.content.filter((c: any) => c.type === 'text').map((c: any) => c.text);
         const text = textParts.join('');
         if (text) messages.push({ role: 'assistant', content: text });
       }
-    } catch {
-    }
+    } catch {}
   }
-
   return messages;
 }
 
 function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null): string {
   const now = new Date();
-  const formatDateTime = (d: Date) => d.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  });
-
-  const lines: string[] = [];
-  lines.push(`# ${title || 'Conversation'}`);
-  lines.push('');
-  lines.push(`Archived: ${formatDateTime(now)}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
-
+  const formatDateTime = (d: Date) => d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+  const lines: string[] = [`# ${title || 'Conversation'}`, '', `Archived: ${formatDateTime(now)}`, '', '---', ''];
   for (const msg of messages) {
     const sender = msg.role === 'user' ? 'User' : 'Andy';
-    const content = msg.content.length > 2000
-      ? msg.content.slice(0, 2000) + '...'
-      : msg.content;
-    lines.push(`**${sender}**: ${content}`);
-    lines.push('');
+    const content = msg.content.length > 2000 ? msg.content.slice(0, 2000) + '...' : msg.content;
+    lines.push(`**${sender}**: ${content}`, '');
   }
-
   return lines.join('\n');
 }
 
 async function main(): Promise<void> {
   let input: ContainerInput;
-
   try {
     const stdinData = await readStdin();
     input = JSON.parse(stdinData);
     log(`Received input for group: ${input.groupFolder}`);
   } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
-    });
+    writeOutput({ status: 'error', result: null, error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}` });
     process.exit(1);
   }
 
-  const ipcMcp = createIpcMcp({
-    chatJid: input.chatJid,
-    groupFolder: input.groupFolder,
-    isMain: input.isMain
-  });
+  const provider = input.provider || (process.env.NANOCLAW_PROVIDER as any) || 'anthropic';
+  const model = input.model || process.env.NANOCLAW_MODEL || 'claude-3-5-sonnet-20241022';
+
+  const ipcMcp = createIpcMcp({ chatJid: input.chatJid, groupFolder: input.groupFolder, isMain: input.isMain });
 
   let result: AgentResponse | null = null;
   let newSessionId: string | undefined;
 
-  // Add context for scheduled tasks
   let prompt = input.prompt;
   if (input.isScheduledTask) {
-    prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${input.prompt}`;
+    prompt = `[SCHEDULED TASK]\n\n${input.prompt}`;
   }
 
-  // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
   if (!input.isMain && fs.existsSync(globalClaudeMdPath)) {
@@ -265,77 +201,62 @@ async function main(): Promise<void> {
   }
 
   try {
-    log('Starting agent...');
-
-    for await (const message of query({
-      prompt,
-      options: {
-        cwd: '/workspace/group',
-        resume: input.sessionId,
-        systemPrompt: globalClaudeMd
-          ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-          : undefined,
-        allowedTools: [
-          'Bash',
-          'Read', 'Write', 'Edit', 'Glob', 'Grep',
-          'WebSearch', 'WebFetch',
-          'mcp__nanoclaw__*'
-        ],
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
-        settingSources: ['project'],
-        mcpServers: {
-          nanoclaw: ipcMcp
-        },
-        hooks: {
-          PreCompact: [{ hooks: [createPreCompactHook()] }]
-        },
-        outputFormat: {
-          type: 'json_schema',
-          schema: AGENT_RESPONSE_SCHEMA,
+    if (provider === 'anthropic') {
+      log(`Starting Anthropic agent (model: ${model})...`);
+      for await (const message of query({
+        prompt,
+        options: {
+          cwd: '/workspace/group',
+          resume: input.sessionId,
+          systemPrompt: globalClaudeMd ? { type: 'preset', preset: 'claude_code', append: globalClaudeMd } : undefined,
+          allowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'mcp__nanoclaw__*'],
+          permissionMode: 'bypassPermissions',
+          allowDangerouslySkipPermissions: true,
+          settingSources: ['project'],
+          mcpServers: { nanoclaw: ipcMcp },
+          hooks: { PreCompact: [{ hooks: [createPreCompactHook()] }] },
+          outputFormat: { type: 'json_schema', schema: AGENT_RESPONSE_SCHEMA }
         }
-      }
-    })) {
-      if (message.type === 'system' && message.subtype === 'init') {
-        newSessionId = message.session_id;
-        log(`Session initialized: ${newSessionId}`);
-      }
-
-      if (message.type === 'result') {
-        if (message.subtype === 'success' && message.structured_output) {
-          result = message.structured_output as AgentResponse;
-          if (result.outputType === 'message' && !result.userMessage) {
-            log('Warning: outputType is "message" but userMessage is missing, treating as "log"');
-            result = { outputType: 'log', internalLog: result.internalLog };
-          }
-          log(`Agent result: outputType=${result.outputType}${result.internalLog ? `, log=${result.internalLog}` : ''}`);
-        } else if (message.subtype === 'success' || message.subtype === 'error_max_structured_output_retries') {
-          // Structured output missing or agent couldn't produce valid structured output — fall back to text
-          log(`Structured output unavailable (subtype=${message.subtype}), falling back to text`);
-          const textResult = 'result' in message ? (message as { result?: string }).result : null;
-          if (textResult) {
-            result = { outputType: 'message', userMessage: textResult };
+      })) {
+        if (message.type === 'system' && message.subtype === 'init') { newSessionId = message.session_id; }
+        if (message.type === 'result') {
+          if (message.subtype === 'success' && message.structured_output) {
+            result = message.structured_output as AgentResponse;
+          } else if (message.subtype === 'success' || message.subtype === 'error_max_structured_output_retries') {
+            const textResult = 'result' in message ? (message as any).result : null;
+            if (textResult) result = { outputType: 'message', userMessage: textResult };
           }
         }
       }
+    } else if (provider === 'openai' || provider === 'ollama') {
+      log(`Starting Generic OpenAI-compatible agent (provider: ${provider}, model: ${model})...`);
+      const client = new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY || 'sk-none',
+        baseURL: process.env.OPENAI_BASE_URL || (provider === 'ollama' ? 'http://host.docker.internal:11434/v1' : undefined)
+      });
+      
+      const response = await client.chat.completions.create({
+        model: model,
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' }
+      });
+
+      const content = response.choices[0].message.content;
+      try {
+        result = JSON.parse(content || '{}');
+      } catch {
+        result = { outputType: 'message', userMessage: content || '' };
+      }
+    } else {
+      throw new Error(`Unsupported provider: ${provider}`);
     }
 
     log('Agent completed successfully');
-    writeOutput({
-      status: 'success',
-      result: result ?? { outputType: 'log' },
-      newSessionId
-    });
-
+    writeOutput({ status: 'success', result: result ?? { outputType: 'log' }, newSessionId });
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
-    writeOutput({
-      status: 'error',
-      result: null,
-      newSessionId,
-      error: errorMessage
-    });
+    writeOutput({ status: 'error', result: null, newSessionId, error: errorMessage });
     process.exit(1);
   }
 }
